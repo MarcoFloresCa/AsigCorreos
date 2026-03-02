@@ -1,0 +1,19 @@
+# Ignore sensitive files
+credentials.json
+token.pickle
+.env
+*.json
+*.pickle
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
