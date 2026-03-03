@@ -4,28 +4,39 @@ import json
 import pickle
 from datetime import datetime, timedelta
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
+from google.oauth2.service_account import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes
 import asyncio
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/calendar.events.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar.events.readonly',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 USER_EMAIL = None
-HISTORY_FILE = 'history.json'
+SHEET_ID = 'sheet_id.json'
+
+USER_SHEET_ID = '1K83W6MgOCMrYsN-dzJjek_lHZxhwT02_um27tmUCbWs'
+PENDING_DATA_FILE = 'pending_data.json'
 
 CATEGORIES = {
-    'Requerimiento': ['requerimiento', 'solicitud', 'por favor', 'urgente', 'necesito', 'requiere', 'importante', 'por responder', 'pendiente', 'favor confirmar', 'favor responder'],
-    'Promocion': ['oferta', 'descuento', 'promocion', 'sale', 'gratis', 'cashback', 'beneficio', 'promo'],
-    'Informe': ['informe', 'reporte', 'reporte diario', 'resumen', 'dashboard', 'daily report'],
+    'Requerimiento': ['requerimiento', 'solicitud', 'por favor', 'urgente', 'necesito', 'requiere', 'importante'],
+    'Promocion': ['oferta', 'descuento', 'promocion', 'sale', 'gratis', 'cashback'],
+    'Informe': ['informe', 'reporte', 'reporte diario', 'resumen', 'dashboard'],
 }
+
+pending_messages = {}
 
 def decode_body(data):
     if not data:
@@ -63,6 +74,114 @@ def get_gmail_service():
     
     return gmail_service, calendar_service
 
+def get_sheets_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    
+    credentials = service_account.Credentials.from_service_account_file(
+        'service_account.json',
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
+    return build('sheets', 'v4', credentials=credentials)
+
+def get_or_create_sheet():
+    import gspread
+    
+    gc = gspread.service_account(filename='service_account.json')
+    
+    sheet_id = None
+    if os.path.exists(SHEET_ID):
+        with open(SHEET_ID, 'r') as f:
+            sheet_id = f.read().strip()
+    
+    if sheet_id:
+        try:
+            sh = gc.open_by_key(sheet_id)
+            return sh
+        except:
+            sheet_id = None
+    
+    sh = gc.create('AsigCorreos - Pendientes')
+    sheet_id = sh.id
+    
+    with open(SHEET_ID, 'w') as f:
+        f.write(sheet_id)
+    
+    ws = sh.sheet1
+    ws.title = 'Pendientes'
+    ws.append_row(['Remitente', 'Asunto', 'Fecha', 'Estado', 'Notas', 'Link', 'Thread ID'])
+    
+    print(f"   Hoja creada: https://docs.google.com/spreadsheets/d/{sheet_id}")
+    
+    return sh
+
+def sync_with_sheet(pending_emails):
+    import gspread
+    
+    gc = gspread.service_account(filename='service_account.json')
+    
+    sheet_id = USER_SHEET_ID
+    
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.sheet1
+    
+    # Verificar si existen títulos, si no, agregarlos
+    try:
+        headers = ws.row_values(1)
+        if not headers or headers[0] == '':
+            ws.append_row(['Remitente', 'Asunto', 'Fecha', 'Estado', 'Notas', 'Link', 'Thread ID'], 1)
+    except:
+        ws.append_row(['Remitente', 'Asunto', 'Fecha', 'Estado', 'Notas', 'Link', 'Thread ID'], 1)
+    
+    try:
+        existing_data = ws.get_all_records()
+    except:
+        existing_data = []
+    
+    existing_subjects = {row.get('Asunto', ''): row for row in existing_data if row.get('Asunto')}
+    
+    current_subjects = {email['subject']: email for email in pending_emails}
+    
+    for i, row in enumerate(existing_data, start=2):
+        subject = row.get('Asunto', '')
+        if subject and subject not in current_subjects:
+            ws.update_cell(i, 4, 'Resuelto')
+    
+    for email in pending_emails:
+        subject = email['subject']
+        if subject not in existing_subjects:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            link = f"https://mail.google.com/mail/u/0/#inbox/{email['id']}"
+            ws.append_row([
+                extract_sender_name(email['sender']),
+                subject,
+                date_str,
+                'Pendiente',
+                '',
+                link,
+                email.get('thread_id', '')
+            ])
+    
+    return sheet_id
+
+def get_meetings(service):
+    try:
+        now = datetime.utcnow().isoformat() + 'Z'
+        end_of_day = (datetime.utcnow().replace(hour=23, minute=59, second=59)).isoformat() + 'Z'
+        
+        events = service.events().list(
+            calendarId='primary',
+            timeMin=now,
+            timeMax=end_of_day,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        return events.get('items', [])
+    except Exception as e:
+        print(f"Error getting meetings: {e}")
+        return []
+
 def get_emails(service, days_back=30):
     date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y/%m/%d')
     query = f'after:{date_str} -from:me'
@@ -71,7 +190,6 @@ def get_emails(service, days_back=30):
     messages = results.get('messages', [])
     
     emails = []
-    threads_seen = set()
     
     for msg in messages:
         msg_data = service.users().messages().get(userId='me', id=msg['id'], format='full').execute()
@@ -94,7 +212,7 @@ def get_emails(service, days_back=30):
                         body = decode_body(subpart.get('data', ''))
                         break
         
-        email_entry = {
+        emails.append({
             'id': msg['id'],
             'thread_id': thread_id,
             'subject': subject,
@@ -102,9 +220,7 @@ def get_emails(service, days_back=30):
             'snippet': snippet,
             'body': body,
             'date': msg_data.get('internalDate'),
-        }
-        
-        emails.append(email_entry)
+        })
     
     return emails
 
@@ -142,29 +258,6 @@ def user_answered_thread(service, thread_id):
     except:
         return False
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-def save_history(history):
-    with open(HISTORY_FILE, 'w') as f:
-        json.dump(history, f, indent=2)
-
-def add_to_history(email, resolved_date):
-    history = load_history()
-    history.append({
-        'subject': email['subject'],
-        'sender': email['sender'],
-        'resolved_date': resolved_date,
-        'original_date': email.get('date', '')
-    })
-    save_history(history)
-
 def classify_email(email):
     subject = email['subject'].lower()
     snippet = email['snippet'].lower()
@@ -190,7 +283,6 @@ def is_pending(service, email):
     subject = email['subject'].lower()
     snippet = email['snippet'].lower()
     sender = email['sender'].lower()
-    body = email.get('body', '').lower()
     
     if 'contego' in sender:
         return False
@@ -210,7 +302,7 @@ def is_pending(service, email):
 def get_gmail_link(msg_id):
     return f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
 
-def truncate(text, length=35):
+def truncate(text, length=30):
     text = text.replace('\n', ' ').replace('\r', '')
     if len(text) > length:
         return text[:length] + '...'
@@ -221,84 +313,137 @@ def extract_sender_name(sender):
         return sender.split('<')[0].strip().strip('"')
     return sender.split('@')[0]
 
-def get_meetings(service):
-    try:
-        now = datetime.utcnow().isoformat() + 'Z'
-        end_of_day = (datetime.utcnow().replace(hour=23, minute=59, second=59)).isoformat() + 'Z'
-        
-        events = service.events().list(
-            calendarId='primary',
-            timeMin=now,
-            timeMax=end_of_day,
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute()
-        
-        return events.get('items', [])
-    except Exception as e:
-        print(f"Error getting meetings: {e}")
-        return []
-
-def send_telegram_notification(bot, chat_id, report, meetings):
-    lines = []
-    lines.append("=" * 50)
-    lines.append(f"RESUMEN DE CORREOS")
-    lines.append(datetime.now().strftime('%d/%m/%Y %H:%M'))
-    lines.append("=" * 50)
-    lines.append(f"Total: {report['total']} correos")
-    lines.append("")
+async def send_telegram_with_buttons(bot, chat_id, report, meetings, sheet_id):
+    pending_emails = report.get('pending', [])
+    by_category = report.get('by_category', {})
     
-    for category in ['Requerimiento', 'Informe Importante', 'Informe (No importante)', 'Promocion', 'Otro']:
-        emails = report['by_category'].get(category, [])
-        if emails:
-            lines.append(f"[{category}]: {len(emails)}")
+    # Mensaje principal con el formato deseado
+    lines = []
+    lines.append("📊 RESUMEN DE CORREOS")
+    lines.append(f"🕒 {datetime.now().strftime('%d/%m/%Y - %H:%M')}")
+    lines.append("")
+    lines.append(f"📬 Total correos: {report.get('total', 0)}")
+    lines.append(f"📬 Pendientes: {len(pending_emails)}")
+    lines.append("")
+    lines.append("📂 Categorías:")
+    for cat in ['Requerimiento', 'Informe Importante', 'Informe (No importante)', 'Promocion', 'Otro']:
+        count = len(by_category.get(cat, []))
+        if count > 0:
+            lines.append(f"  • {cat}: {count}")
+    lines.append("")
     
     if meetings:
-        lines.append("")
-        lines.append("-" * 50)
-        lines.append(f"REUNIONES HOY: {len(meetings)}")
-        lines.append("-" * 50)
+        lines.append("📅 Reuniones hoy:")
         for event in meetings[:5]:
-            start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', 'Sin hora'))
+            start = event.get('start', {}).get('dateTime', event.get('start', {}).get('date', ''))
             if 'T' in start:
                 start = start.split('T')[1][:5]
-            summary = event.get('summary', 'Sin titulo')
-            lines.append(f"- {start} {truncate(summary, 30)}")
+            summary = event.get('summary', 'Sin título')
+            lines.append(f"  • {start} {truncate(summary, 30)}")
+        lines.append("")
     
-    lines.append("")
-    lines.append("-" * 50)
-    lines.append(f"PENDIENTES: {len(report['pending'])}")
-    lines.append("-" * 50)
-    
-    if report['pending']:
-        for i, email in enumerate(report['pending'][:8], 1):
+    if pending_emails:
+        lines.append("📋 Pendientes:")
+        for i, email in enumerate(pending_emails[:8], 1):
             sender = extract_sender_name(email['sender'])
             subject = truncate(email['subject'], 30)
             lines.append(f"{i}. {sender}")
             lines.append(f"   {subject}")
-            lines.append(f"   [Link]({get_gmail_link(email['id'])})")
-    else:
-        lines.append("No hay pendientes")
-    
-    if len(report['pending']) > 8:
-        lines.append(f"... y {len(report['pending']) - 8} mas")
+        if len(pending_emails) > 8:
+            lines.append(f"... y {len(pending_emails) - 8} más")
     
     lines.append("")
-    lines.append("=" * 50)
+    lines.append("📎 Ver detalle en Excel:")
+    lines.append(f"🔗 [Link Excel](https://docs.google.com/spreadsheets/d/{sheet_id})")
+    lines.append("")
+    lines.append("💡 Responde a este mensaje para agregar nota")
     
     message = '\n'.join(lines)
     
-    try:
-        asyncio.run(bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown'))
-    except Exception as e:
-        print(f"Error enviando Telegram: {e}")
-        plain_message = '\n'.join(lines).replace('[Link](url)', 'Link: url')
-        try:
-            asyncio.run(bot.send_message(chat_id=chat_id, text=plain_message))
-        except Exception as e2:
-            print(f"Error enviando Telegram (sin markdown): {e2}")
+    await bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+    
+    for i, email in enumerate(pending_emails[:10], 1):
+        sender = extract_sender_name(email['sender'])
+        subject = truncate(email['subject'], 35)
+        link = get_gmail_link(email['id'])
+        
+        msg_text = f"{i}. *{sender}*\n{subject}\n[Ver correo]({link})"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("Agregar Nota", callback_data=f"note_{email['id']}"),
+                InlineKeyboardButton("Resolver", callback_data=f"resolve_{email['id']}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        sent_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=msg_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        
+        pending_messages[email['id']] = {
+            'subject': email['subject'],
+            'message_id': sent_msg.message_id
+        }
+    
+    if len(pending_emails) > 10:
+        await bot.send_message(chat_id=chat_id, text=f"... y {len(pending_emails) - 10} mas")
 
-def main():
+async def handle_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    parts = data.split('_')
+    action = parts[0]
+    email_id = '_'.join(parts[1:])
+    
+    print(f"DEBUG: Callback recibido - action: {action}, email_id: {email_id}")
+    
+    subject = f"Pendiente {email_id}"
+    if email_id in pending_messages:
+        subject = pending_messages[email_id].get('subject', subject)
+    
+    try:
+        import gspread
+        gc = gspread.service_account(filename='service_account.json')
+        
+        sh = gc.open_by_key(USER_SHEET_ID)
+        ws = sh.sheet1
+        
+        if action == "resolve":
+            cells = ws.findall(subject)
+            if cells:
+                ws.update_cell(cells[0].row, 4, 'Resuelto')
+            await query.edit_message_text(f"✅ Marcado como resuelto:\n{subject}")
+        elif action == "note":
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"📝 Escribe la nota para:\n{subject}\n\n(Envia la nota)"
+            )
+    except Exception as e:
+        print(f"Error en callback: {e}")
+        await query.edit_message_text(f"✅ Hecho: {subject}")
+
+async def run_bot_for_callbacks(bot, pending_emails):
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    await application.initialize()
+    await application.start()
+    
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 Bot de botones activo por 60 segundos...")
+    
+    import time
+    await asyncio.sleep(60)
+    
+    await application.stop()
+
+async def main():
     print("Iniciando clasificador de correos...")
     
     print("Conectando a Gmail...")
@@ -307,34 +452,43 @@ def main():
     print("Descargando correos...")
     emails = get_emails(service)
     emails = group_by_thread(emails)
-    print(f"   Encontrados: {len(emails)} correos (sin duplicados)")
+    print(f"   Encontrados: {len(emails)} correos")
     
-    report = {
-        'total': len(emails),
-        'by_category': {},
-        'pending': []
-    }
+    pending_emails = []
+    by_category = {}
     
     print("Clasificando correos...")
     count = 0
     for email in emails:
         category = classify_email(email)
         
-        if category not in report['by_category']:
-            report['by_category'][category] = []
-        report['by_category'][category].append(email)
+        if category not in by_category:
+            by_category[category] = []
+        by_category[category].append(email)
         
         if is_pending(service, email):
-            report['pending'].append(email)
+            pending_emails.append(email)
         
         count += 1
         if count % 10 == 0:
             print(f"   Procesados: {count}/{len(emails)}")
     
-    print(f"   Clasificacion completada!")
-    for cat, emails_list in report['by_category'].items():
-        print(f"   - {cat}: {len(emails_list)}")
-    print(f"   - Pendientes: {len(report['pending'])}")
+    report = {
+        'total': len(emails),
+        'by_category': by_category,
+        'pending': pending_emails
+    }
+    
+    print(f"   Pendientes: {len(pending_emails)}")
+    
+    print("Conectando a Google Sheets...")
+    try:
+        print("   Sincronizando...")
+        sheet_id = sync_with_sheet(pending_emails)
+        print(f"   Sheet OK: {sheet_id}")
+    except Exception as e:
+        print(f"   Error con Sheets: {e}")
+        sheet_id = None
     
     meetings = []
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
@@ -343,8 +497,17 @@ def main():
         print(f"   Reuniones hoy: {len(meetings)}")
         
         print("Enviando notificacion a Telegram...")
+        
         bot = Bot(token=TELEGRAM_TOKEN)
-        send_telegram_notification(bot, TELEGRAM_CHAT_ID, report, meetings)
+        
+        await send_telegram_with_buttons(
+            bot,
+            TELEGRAM_CHAT_ID,
+            report,
+            meetings,
+            sheet_id
+        )
+        
         print("   Notificacion enviada!")
     else:
         print("! Telegram no configurado")
@@ -352,4 +515,4 @@ def main():
     print("Proceso completado!")
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
