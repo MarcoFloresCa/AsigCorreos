@@ -137,7 +137,7 @@ def get_meetings(service):
         print(f"Error getting meetings: {e}")
         return []
 
-def get_emails(service, days_back=30):
+def get_emails(service, days_back=7):
     date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y/%m/%d')
     query = f'after:{date_str} -from:me'
     print(f"   Query: {query}")
